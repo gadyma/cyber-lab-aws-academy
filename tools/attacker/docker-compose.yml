@@ -1,0 +1,27 @@
+# Attacker Kali web desktop. The image is built locally from ./Dockerfile so
+# the Kali toolset and HexStrike AI are baked in. Build args come from
+# tools/lab-boot.sh (which passes the CloudFormation parameters).
+#
+# The desktop password is supplied at RUN time via VNC_PW (env from lab-boot),
+# never baked into the image.
+services:
+  kali-desktop:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-kasmweb/kali-rolling-desktop:1.16.0}
+        KALI_TOOLSET: ${KALI_TOOLSET:-kali-tools-top10}
+    image: lab/kali-desktop:local
+    restart: unless-stopped
+    shm_size: "1gb"
+    # Raw-socket tools (nmap -sS/-O, ping sweeps, etc.) need these capabilities.
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    ports:
+      - "6901:6901"
+    environment:
+      - VNC_PW=${VNC_PW:-ChangeMe-LabPassw0rd!}

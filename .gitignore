@@ -1,0 +1,12 @@
+# Never commit secrets or class-specific data
+*.env
+lab.env
+flags.csv
+roster.txt
+*.pem
+*.key
+
+# Local noise
+.DS_Store
+Thumbs.db
+*.log

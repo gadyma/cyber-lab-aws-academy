@@ -1,0 +1,47 @@
+# CTFd for the INSTRUCTOR's own machine/account (NOT Learner Lab, NOT students).
+# Students submit flags here; see scoreboard/README.md for challenge setup.
+#
+#   docker compose -f docker-compose.ctfd.yml up -d
+#   open http://localhost:8000  (first run: create the admin account)
+#
+# Change SECRET_KEY and the DB password before exposing this beyond localhost.
+services:
+  ctfd:
+    image: ctfd/ctfd:3.7.0
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - SECRET_KEY=change-me-ctfd-secret
+      - DATABASE_URL=mysql+pymysql://ctfd:change-me-db-pass@db/ctfd
+      - REDIS_URL=redis://cache:6379
+      - WORKERS=2
+      - LOG_FOLDER=/var/log/CTFd
+      - UPLOAD_FOLDER=/var/uploads
+    volumes:
+      - ctfd-logs:/var/log/CTFd
+      - ctfd-uploads:/var/uploads
+    depends_on:
+      - db
+      - cache
+
+  db:
+    image: mariadb:10.11
+    restart: unless-stopped
+    environment:
+      - MARIADB_ROOT_PASSWORD=change-me-root-pass
+      - MARIADB_DATABASE=ctfd
+      - MARIADB_USER=ctfd
+      - MARIADB_PASSWORD=change-me-db-pass
+    volumes:
+      - ctfd-db:/var/lib/mysql
+    command: [mysqld, --character-set-server=utf8mb4, --collation-server=utf8mb4_unicode_ci, --wait_timeout=28800]
+
+  cache:
+    image: redis:7-alpine
+    restart: unless-stopped
+
+volumes:
+  ctfd-db:
+  ctfd-logs:
+  ctfd-uploads:

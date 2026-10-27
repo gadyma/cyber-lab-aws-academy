@@ -1,0 +1,65 @@
+# Target vulnerable-app stack. Each app on a distinct host port.
+# restart: unless-stopped + the lab-boot systemd unit means everything comes
+# back after a Learner Lab session stop/start without manual steps.
+#
+# NOTE ON IMAGES: tags are pinned where a stable tag exists. If an image is
+# unavailable in your region/at pull time, see docs/instructor-guide.md for
+# vetted alternates. All images are well-known, deliberately vulnerable targets
+# meant ONLY for use inside this isolated lab.
+services:
+  juice-shop:
+    image: bkimminich/juice-shop:v17.1.1
+    restart: unless-stopped
+    ports: ["3000:3000"]
+
+  dvwa:
+    image: ghcr.io/digininja/dvwa:latest
+    restart: unless-stopped
+    # DVWA's web image needs an external DB; point it at the dvwa-db service.
+    environment:
+      - DB_SERVER=dvwa-db
+    depends_on: [dvwa-db]
+    ports: ["8081:80"]
+
+  dvwa-db:
+    image: mariadb:10
+    restart: unless-stopped
+    # Credentials match DVWA's baked-in config.inc.php (dvwa / p@ssw0rd).
+    environment:
+      - MYSQL_ROOT_PASSWORD=dvwa
+      - MYSQL_DATABASE=dvwa
+      - MYSQL_USER=dvwa
+      - MYSQL_PASSWORD=p@ssw0rd
+    # Internal only (no published host port); reachable by dvwa on the compose net.
+
+  webgoat:
+    image: webgoat/webgoat:v2023.8
+    restart: unless-stopped
+    ports: ["8082:8080", "9090:9090"]
+
+  bwapp:
+    image: raesene/bwapp:latest
+    restart: unless-stopped
+    ports: ["8083:80"]
+
+  mutillidae:
+    image: citizenstig/nowasp:latest
+    restart: unless-stopped
+    ports: ["8084:80"]
+
+  vampi:
+    # VAmPI - deliberately vulnerable REST API: JWT auth flaws, BOLA/IDOR,
+    # SQL injection, mass assignment, excessive data exposure. Swagger UI at
+    # /ui/ . Self-contained (SQLite); GET /createdb seeds it (run at boot).
+    image: erev0s/vampi:latest
+    restart: unless-stopped
+    environment:
+      - vulnerable=1
+    ports: ["8085:5000"]
+
+  vulnerable-flask:
+    # Built locally from ./vulnerable-flask (no reliable public image exists).
+    build: ./vulnerable-flask
+    image: lab/vulnerable-flask:local
+    restart: unless-stopped
+    ports: ["8086:5000"]

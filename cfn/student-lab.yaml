@@ -1,0 +1,509 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  Cyber Attack & Defense teaching lab for AWS Academy Learner Lab.
+  Deploys an isolated VPC with a TARGET instance (Docker Compose of deliberately
+  vulnerable web apps) and an ATTACKER instance (Kali web desktop + HexStrike AI).
+  Uses the pre-provisioned LabRole / LabInstanceProfile only - it never creates IAM
+  roles. Each student launches it in their own Learner Lab account. UserData is a
+  thin bootstrapper that clones this repo and runs tools/lab-boot.sh, so the repo
+  is the single source of truth. SCOPE: all testing stays inside this VPC. See
+  docs/safety.md.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Access control (who can reach the attacker desktop)"
+        Parameters:
+          - StudentIP
+      - Label:
+          default: "Sizing"
+        Parameters:
+          - InstanceType
+          - TargetVolumeSizeGb
+          - AttackerVolumeSizeGb
+      - Label:
+          default: "AI agent / LLM egress"
+        Parameters:
+          - LLMEndpoint
+          - AttackerEgressMode
+      - Label:
+          default: "Lab assets (where the boot scripts come from)"
+        Parameters:
+          - RepoUrl
+          - RepoBranch
+      - Label:
+          default: "Images & software (override only if a default is unavailable)"
+        Parameters:
+          - LatestAmiId
+          - KaliDesktopImage
+          - KaliToolset
+          - KasmDesktopPassword
+      - Label:
+          default: "Lab identity / scoreboard"
+        Parameters:
+          - StudentId
+          - EnableFlags
+          - FlagSecret
+    ParameterLabels:
+      StudentIP:
+        default: "Your public IP in CIDR form (e.g. 203.0.113.4/32)"
+      InstanceType:
+        default: "EC2 instance type for both hosts"
+      LLMEndpoint:
+        default: "Hostname the AI agent may reach for the LLM"
+      AttackerEgressMode:
+        default: "Attacker outbound posture"
+      RepoUrl:
+        default: "Public git URL of THIS lab repo (set to your fork)"
+
+Parameters:
+
+  StudentIP:
+    Type: String
+    Description: >-
+      CIDR allowed to reach the attacker web desktop and SSH. Use YOUR current
+      public IP with /32 (find it at https://checkip.amazonaws.com). Do NOT use
+      0.0.0.0/0 - that exposes the desktop to the whole internet.
+    Default: 0.0.0.0/0
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    ConstraintDescription: Must be a valid CIDR such as 203.0.113.4/32.
+
+  InstanceType:
+    Type: String
+    Description: Instance type for the target and attacker. t3.large is the tested default.
+    Default: t3.large
+    AllowedValues:
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+    ConstraintDescription: Learner Lab typically permits up to t3/t2 sizes only.
+
+  TargetVolumeSizeGb:
+    Type: Number
+    Description: Root EBS size (GiB) for the target. The vulnerable-app images need room.
+    Default: 40
+    MinValue: 30
+    MaxValue: 100
+
+  AttackerVolumeSizeGb:
+    Type: Number
+    Description: Root EBS size (GiB) for the attacker. The Kali desktop + tools image is large.
+    Default: 50
+    MinValue: 30
+    MaxValue: 120
+
+  LLMEndpoint:
+    Type: String
+    Description: >-
+      Hostname (no scheme) the AI agent is allowed to reach for model calls when
+      egress is Locked - e.g. your LLM proxy, api.anthropic.com, or a Bedrock
+      endpoint. Bedrock access in Learner Lab is NOT guaranteed; verify in your
+      console. Only enforced in Locked mode (see AttackerEgressMode).
+    Default: api.anthropic.com
+
+  AttackerEgressMode:
+    Type: String
+    Description: >-
+      Open  = attacker may reach the internet on 443/80 (needed for first-boot
+      image/tool pulls and setup). Locked = attacker may only reach the lab
+      subnet and DNS (443 stays open for the LLM; narrow it to a prefix list for
+      true lockdown - see docs/safety.md). Deploy with Open, let it finish
+      booting, then UPDATE the stack to Locked for the attack exercises.
+    Default: Open
+    AllowedValues:
+      - Open
+      - Locked
+
+  RepoUrl:
+    Type: String
+    Description: >-
+      Public HTTPS git URL of THIS repository. The instances clone it at first
+      boot to get the boot scripts, compose files and flag planter. CHANGE this
+      to your own public fork before distributing the template to students.
+    Default: https://github.com/gadyma/cyber-lab-aws-academy.git
+
+  RepoBranch:
+    Type: String
+    Description: Branch to clone.
+    Default: main
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Description: >-
+      Ubuntu 22.04 LTS AMI, resolved from the public SSM Parameter Store alias so
+      it is always current and region-correct. Do not change unless you must pin.
+    Default: /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id
+
+  KaliDesktopImage:
+    Type: String
+    Description: >-
+      Base Docker image for the attacker Kali web desktop (KasmVNC on 6901). The
+      default is the public Kasm single-container Kali image. The boot script
+      extends it with the Kali toolset and HexStrike AI.
+    Default: kasmweb/kali-rolling-desktop:1.16.0
+
+  KaliToolset:
+    Type: String
+    Description: >-
+      Which Kali metapackage to install into the attacker desktop. top10/web are
+      far smaller and faster to build than the full headless set; use headless
+      only if you have time and disk.
+    Default: kali-tools-top10
+    AllowedValues:
+      - kali-tools-top10
+      - kali-tools-web
+      - kali-linux-headless
+
+  KasmDesktopPassword:
+    Type: String
+    Description: >-
+      Password for the Kali web desktop user "kasm_user". CHANGE THIS. It is only
+      reachable from StudentIP, but still set a non-default value.
+    Default: ChangeMe-LabPassw0rd!
+    NoEcho: true
+    MinLength: 8
+
+  StudentId:
+    Type: String
+    Description: >-
+      Your student identifier (used only to derive per-student CTF flags locally
+      on the target; never leaves the instance). Any short string is fine.
+    Default: student-000
+    AllowedPattern: ^[A-Za-z0-9._-]{1,64}$
+
+  EnableFlags:
+    Type: String
+    Description: Plant per-student CTF flags in the target containers at boot (scoreboard phase 2).
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  FlagSecret:
+    Type: String
+    Description: >-
+      HMAC key used to derive per-student flags (flag = HMAC(FlagSecret, StudentId|app)).
+      Keep the SAME secret across all students so you can recompute and verify flags.
+      Ignored when EnableFlags is false.
+    Default: change-me-flag-secret
+    NoEcho: true
+
+Conditions:
+  IsLockedEgress: !Equals [!Ref AttackerEgressMode, "Locked"]
+
+Resources:
+
+  # --- Networking -----------------------------------------------------------
+  LabVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-vpc"
+        - Key: Project
+          Value: cyber-lab-aws-academy
+
+  LabInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-igw"
+
+  LabIgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref LabVPC
+      InternetGatewayId: !Ref LabInternetGateway
+
+  LabSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LabVPC
+      CidrBlock: 10.20.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-lab-subnet"
+
+  LabRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref LabVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-rtb"
+
+  LabDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: LabIgwAttachment
+    Properties:
+      RouteTableId: !Ref LabRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref LabInternetGateway
+
+  LabSubnetRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref LabSubnet
+      RouteTableId: !Ref LabRouteTable
+
+  # --- Security groups ------------------------------------------------------
+  # Target: NO public inbound. Only the attacker SG may reach the app ports.
+  TargetSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Target - vulnerable apps. Inbound only from the attacker SG.
+      VpcId: !Ref LabVPC
+      SecurityGroupEgress:
+        # Target needs 443/80 to pull images on first boot; images then persist
+        # on the EBS volume across session stop/start so later boots need nothing.
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS egress for Docker image pulls (first boot)
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP egress for apt/image pulls (first boot)
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: DNS
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-target-sg"
+
+  AttackerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Attacker - Kali web desktop. Inbound only from StudentIP.
+      VpcId: !Ref LabVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6901
+          ToPort: 6901
+          CidrIp: !Ref StudentIP
+          Description: Kasm Kali web desktop (HTTPS)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref StudentIP
+          Description: SSH for setup/debug
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-attacker-sg"
+
+  # Target accepts the vulnerable-app host ports ONLY from the attacker SG.
+  TargetIngressFromAttacker:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref TargetSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 9090
+      SourceSecurityGroupId: !Ref AttackerSecurityGroup
+      Description: All lab app host ports (3000-9090) reachable only from the attacker
+
+  # --- Attacker egress: Open vs Locked -------------------------------------
+  # With NO explicit egress rules (Open mode) a security group allows all
+  # outbound. Switching to Locked adds the rules below and removes allow-all.
+  AttackerEgressLabLocked:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: IsLockedEgress
+    Properties:
+      GroupId: !Ref AttackerSecurityGroup
+      IpProtocol: "-1"
+      CidrIp: 10.20.0.0/16
+      Description: "[Locked] Reach the lab VPC only"
+
+  AttackerEgressLlmLocked:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: IsLockedEgress
+    Properties:
+      GroupId: !Ref AttackerSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      Description: !Sub "[Locked] HTTPS for the LLM endpoint (${LLMEndpoint}) - narrow to a prefix list for true lockdown"
+
+  AttackerEgressDnsLocked:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: IsLockedEgress
+    Properties:
+      GroupId: !Ref AttackerSecurityGroup
+      IpProtocol: udp
+      FromPort: 53
+      ToPort: 53
+      CidrIp: 0.0.0.0/0
+      Description: "[Locked] DNS"
+
+  # --- Target instance ------------------------------------------------------
+  TargetInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: LabInstanceProfile
+      SubnetId: !Ref LabSubnet
+      SecurityGroupIds:
+        - !Ref TargetSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: !Ref TargetVolumeSizeGb
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-target"
+        - Key: Role
+          Value: target
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > /var/log/lab-userdata.log 2>&1
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y docker.io docker-compose-v2 git curl jq openssl
+          systemctl enable --now docker
+
+          install -d -m 0755 /opt/lab
+          cat > /opt/lab/lab.env <<EOF
+          LAB_ROLE=target
+          STUDENT_ID=${StudentId}
+          ENABLE_FLAGS=${EnableFlags}
+          FLAG_SECRET=${FlagSecret}
+          EOF
+          chmod 600 /opt/lab/lab.env
+
+          git clone --depth 1 --branch ${RepoBranch} ${RepoUrl} /opt/lab/repo
+          ln -sf /opt/lab/repo/tools/lab-boot.sh /opt/lab/lab-boot.sh
+
+          cat > /etc/systemd/system/lab-boot.service <<'UNIT'
+          [Unit]
+          Description=Cyber lab - start lab services (role from /opt/lab/lab.env)
+          After=docker.service network-online.target
+          Requires=docker.service
+          Wants=network-online.target
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          EnvironmentFile=/opt/lab/lab.env
+          ExecStart=/opt/lab/lab-boot.sh
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+
+          systemctl daemon-reload
+          systemctl enable --now lab-boot.service
+
+  # --- Attacker instance ----------------------------------------------------
+  AttackerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: LabInstanceProfile
+      SubnetId: !Ref LabSubnet
+      SecurityGroupIds:
+        - !Ref AttackerSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: !Ref AttackerVolumeSizeGb
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-attacker"
+        - Key: Role
+          Value: attacker
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > /var/log/lab-userdata.log 2>&1
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y docker.io docker-compose-v2 git curl jq openssl
+          systemctl enable --now docker
+
+          install -d -m 0755 /opt/lab
+          cat > /opt/lab/lab.env <<EOF
+          LAB_ROLE=attacker
+          TARGET_HOST=${TargetInstance.PrivateIp}
+          LLM_ENDPOINT=${LLMEndpoint}
+          KASM_PASSWORD=${KasmDesktopPassword}
+          KALI_IMAGE=${KaliDesktopImage}
+          KALI_TOOLSET=${KaliToolset}
+          EOF
+          chmod 600 /opt/lab/lab.env
+
+          git clone --depth 1 --branch ${RepoBranch} ${RepoUrl} /opt/lab/repo
+          ln -sf /opt/lab/repo/tools/lab-boot.sh /opt/lab/lab-boot.sh
+
+          cat > /etc/systemd/system/lab-boot.service <<'UNIT'
+          [Unit]
+          Description=Cyber lab - start lab services (role from /opt/lab/lab.env)
+          After=docker.service network-online.target
+          Requires=docker.service
+          Wants=network-online.target
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          EnvironmentFile=/opt/lab/lab.env
+          ExecStart=/opt/lab/lab-boot.sh
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+
+          systemctl daemon-reload
+          systemctl enable --now lab-boot.service
+
+Outputs:
+
+  AttackerDesktopURL:
+    Description: Open in your browser (accept the self-signed cert). Log in as kasm_user with your KasmDesktopPassword.
+    Value: !Sub "https://${AttackerInstance.PublicIp}:6901"
+
+  AttackerDesktopUser:
+    Description: Web desktop username
+    Value: kasm_user
+
+  AttackerSSH:
+    Description: SSH to the attacker Ubuntu host (it runs the Kali container)
+    Value: !Sub "ssh ubuntu@${AttackerInstance.PublicIp}"
+
+  TargetPrivateIP:
+    Description: Private IP of the target - use THIS from inside the Kali desktop (never a public IP).
+    Value: !GetAtt TargetInstance.PrivateIp
+
+  TargetAppPorts:
+    Description: Vulnerable apps on the target (reach via the target private IP from the attacker).
+    Value: >-
+      Juice Shop :3000 | DVWA :8081 | WebGoat :8082 | bWAPP :8083 |
+      Mutillidae :8084 | VAmPI :8085 | Vulnerable Flask :8086
+
+  EgressMode:
+    Description: Current attacker egress posture.
+    Value: !Ref AttackerEgressMode
+
+  NextSteps:
+    Description: What to do after the stack completes.
+    Value: >-
+      1) Wait ~8-15 min for first-boot clone/pull/build (watch /var/log/lab-userdata.log).
+      2) Open the AttackerDesktopURL. 3) Reach the target apps at TargetPrivateIP.
+      4) UPDATE the stack to AttackerEgressMode=Locked before the attack exercises.
+      5) STOP both instances at the end of your session to save credit.
